@@ -53,13 +53,21 @@ TypeHandle ShaderGenerator::_type_handle;
 
 #ifdef HAVE_CG
 
-#define PACK_COMBINE(src0, op0, src1, op1, src2, op2) ( \
-  ((uint16_t)src0) | ((((uint16_t)op0 - 1u) & 3u) << 3u) | \
-  ((uint16_t)src1 << 5u) | ((((uint16_t)op1 - 1u) & 3u) << 8u) | \
-  ((uint16_t)src2 << 10u) | ((((uint16_t)op2 - 1u) & 3u) << 13u))
-
 #define UNPACK_COMBINE_SRC(from, n) (TextureStage::CombineSource)((from >> ((uint16_t)n * 5u)) & 7u)
 #define UNPACK_COMBINE_OP(from, n) (TextureStage::CombineOperand)(((from >> (((uint16_t)n * 5u) + 3u)) & 3u) + 1u)
+
+static inline uint16_t
+pack_combine(TextureStage::CombineSource src0, TextureStage::CombineOperand op0,
+             TextureStage::CombineSource src1, TextureStage::CombineOperand op1,
+             TextureStage::CombineSource src2, TextureStage::CombineOperand op2) {
+  if (op0 == TextureStage::CO_undefined) op0 = TextureStage::CO_src_alpha;
+  if (op1 == TextureStage::CO_undefined) op1 = TextureStage::CO_src_alpha;
+  if (op2 == TextureStage::CO_undefined) op2 = TextureStage::CO_src_alpha;
+
+  return ((uint16_t)src0) | ((((uint16_t)op0 - 1u) & 3u) << 3u) |
+         ((uint16_t)src1 << 5u) | ((((uint16_t)op1 - 1u) & 3u) << 8u) |
+         ((uint16_t)src2 << 10u) | ((((uint16_t)op2 - 1u) & 3u) << 13u);
+}
 
 static PStatCollector lookup_collector("*:Munge:ShaderGen:Lookup");
 static PStatCollector synthesize_collector("*:Munge:ShaderGen:Synthesize");
@@ -286,8 +294,14 @@ analyze_renderstate(ShaderKey &key, const RenderState *rs) {
 
       if (node->is_of_type(LightLensNode::get_class_type())) {
         const LightLensNode *llnode = (const LightLensNode *)node;
-        if (shader_attrib->auto_shadow_on() && llnode->is_shadow_caster()) {
-          info._flags |= ShaderKey::LF_has_shadows;
+        if (shader_attrib->auto_shadow_on()) {
+          if (llnode->is_shadow_caster()) {
+            info._flags |= ShaderKey::LF_has_shadows;
+          }
+
+          // Make sure that the next time the shadows are toggled on this
+          // light, it triggers a state rehash.
+          llnode->mark_used_by_auto_shader();
         }
         if (llnode->has_specular_color()) {
           info._flags |= ShaderKey::LF_has_specular_color;
@@ -399,11 +413,12 @@ analyze_renderstate(ShaderKey &key, const RenderState *rs) {
       if (stage->get_alpha_scale() == 4) {
         info._flags |= ShaderKey::TF_alpha_scale_4;
       }
-      info._combine_rgb = PACK_COMBINE(
+
+      info._combine_rgb = pack_combine(
         stage->get_combine_rgb_source0(), stage->get_combine_rgb_operand0(),
         stage->get_combine_rgb_source1(), stage->get_combine_rgb_operand1(),
         stage->get_combine_rgb_source2(), stage->get_combine_rgb_operand2());
-      info._combine_alpha = PACK_COMBINE(
+      info._combine_alpha = pack_combine(
         stage->get_combine_alpha_source0(), stage->get_combine_alpha_operand0(),
         stage->get_combine_alpha_source1(), stage->get_combine_alpha_operand1(),
         stage->get_combine_alpha_source2(), stage->get_combine_alpha_operand2());
@@ -841,7 +856,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
   if (need_eye_normal) {
     eye_normal_freg = alloc_freg();
     text << "\t uniform float4x4 tpose_view_to_model,\n";
-    text << "\t out float4 l_eye_normal : " << eye_normal_freg << ",\n";
+    text << "\t out float3 l_eye_normal : " << eye_normal_freg << ",\n";
   }
   if ((key._texture_flags & ShaderKey::TF_map_height) != 0 || need_world_normal || need_eye_normal) {
     text << "\t in float3 vtx_normal : " << normal_vreg << ",\n";
@@ -928,8 +943,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
     text << "\t l_eye_position = mul(trans_model_to_view, vtx_position);\n";
   }
   if (need_eye_normal) {
-    text << "\t l_eye_normal.xyz = normalize(mul((float3x3)tpose_view_to_model, vtx_normal));\n";
-    text << "\t l_eye_normal.w = 0;\n";
+    text << "\t l_eye_normal = normalize(mul((float3x3)tpose_view_to_model, vtx_normal));\n";
   }
   pmap<const InternalName *, const char *>::const_iterator it;
   for (it = texcoord_fregs.begin(); it != texcoord_fregs.end(); ++it) {
@@ -978,7 +992,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
     text << "\t in float4 l_eye_position : " << eye_position_freg << ",\n";
   }
   if (need_eye_normal) {
-    text << "\t in float4 l_eye_normal : " << eye_normal_freg << ",\n";
+    text << "\t in float3 l_eye_normal : " << eye_normal_freg << ",\n";
   }
   for (it = texcoord_fregs.begin(); it != texcoord_fregs.end(); ++it) {
     text << "\t in float4 l_" << it->first->join("_") << " : " << it->second << ",\n";
@@ -1087,8 +1101,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
       text << "\t float4 texcoord" << i << " = l_eye_position;\n";
       break;
     case TexGenAttrib::M_eye_normal:
-      text << "\t float4 texcoord" << i << " = l_eye_normal;\n";
-      text << "\t texcoord" << i << ".w = 1.0f;\n";
+      text << "\t float4 texcoord" << i << " = float4(l_eye_normal, 1.0f);\n";
       break;
     default:
       text << "\t float4 texcoord" << i << " = float4(0, 0, 0, 0);\n";
@@ -1178,6 +1191,10 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
       text << ");\n";
     }
   }
+  if (need_eye_normal) {
+    text << "\t // Correct the surface normal for interpolation effects\n";
+    text << "\t l_eye_normal = normalize(l_eye_normal);\n";
+  }
   if (key._texture_flags & ShaderKey::TF_map_normal) {
     text << "\t // Translate tangent-space normal in map to view-space.\n";
 
@@ -1187,7 +1204,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
       const ShaderKey::TextureInfo &tex = key._textures[i];
       if (tex._flags & ShaderKey::TF_map_normal) {
         if (is_first) {
-          text << "\t float3 tsnormal = (tex" << i << ".xyz * 2) - 1;\n";
+          text << "\t float3 tsnormal = normalize((tex" << i << ".xyz * 2) - 1);\n";
           is_first = false;
           continue;
         }
@@ -1196,17 +1213,14 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
         text << "\t tsnormal = normalize(tsnormal * dot(tsnormal, tmp" << i << ") - tmp" << i << " * tsnormal.z);\n";
       }
     }
-    text << "\t l_eye_normal.xyz *= tsnormal.z;\n";
-    text << "\t l_eye_normal.xyz += l_tangent * tsnormal.x;\n";
-    text << "\t l_eye_normal.xyz += l_binormal * tsnormal.y;\n";
-  }
-  if (need_eye_normal) {
-    text << "\t // Correct the surface normal for interpolation effects\n";
-    text << "\t l_eye_normal.xyz = normalize(l_eye_normal.xyz);\n";
+    text << "\t l_eye_normal *= tsnormal.z;\n";
+    text << "\t l_eye_normal += normalize(l_tangent) * tsnormal.x;\n";
+    text << "\t l_eye_normal += normalize(l_binormal) * tsnormal.y;\n";
+    text << "\t l_eye_normal = normalize(l_eye_normal);\n";
   }
   if (key._outputs & AuxBitplaneAttrib::ABO_aux_normal) {
     text << "\t // Output the camera-space surface normal\n";
-    text << "\t o_aux.rgb = (l_eye_normal.xyz*0.5) + float3(0.5,0.5,0.5);\n";
+    text << "\t o_aux.rgb = (l_eye_normal*0.5) + float3(0.5,0.5,0.5);\n";
   }
   if (key._lighting) {
     text << "\t // Begin view-space light calculations\n";
@@ -1242,7 +1256,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
         text << "\t lspec  = lcolor;\n";
       }
       text << "\t lvec   = attr_light" << i << "[3].xyz;\n";
-      text << "\t lcolor *= saturate(dot(l_eye_normal.xyz, lvec.xyz));\n";
+      text << "\t lcolor *= saturate(dot(l_eye_normal, lvec.xyz));\n";
       if (light._flags & ShaderKey::LF_has_shadows) {
         if (_use_shadow_filter) {
           text << "\t lshad = shadow2DProj(shadow_" << i << ", l_lightcoord" << i << ").r;\n";
@@ -1259,7 +1273,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
         } else {
           text << "\t lhalf = normalize(lvec - float3(0, 1, 0));\n";
         }
-        text << "\t lspec *= pow(saturate(dot(l_eye_normal.xyz, lhalf)), shininess);\n";
+        text << "\t lspec *= pow(saturate(dot(l_eye_normal, lhalf)), shininess);\n";
         text << "\t tot_specular += lspec;\n";
       }
     } else if (light._type.is_derived_from(PointLight::get_class_type())) {
@@ -1279,7 +1293,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
         text << "\t ldist = max(ldist, attr_light" << i << "[2].w);\n";
       }
       text << "\t lattenv = 1/(latten.x + latten.y*ldist + latten.z*ldist*ldist);\n";
-      text << "\t lcolor *= lattenv * saturate(dot(l_eye_normal.xyz, lvec));\n";
+      text << "\t lcolor *= lattenv * saturate(dot(l_eye_normal, lvec));\n";
       if (light._flags & ShaderKey::LF_has_shadows) {
         text << "\t ldist = max(abs(l_lightcoord" << i << ".x), max(abs(l_lightcoord" << i << ".y), abs(l_lightcoord" << i << ".z)));\n";
         text << "\t ldist = ((latten.w+lpoint.w)/(latten.w-lpoint.w))+((-2*latten.w*lpoint.w)/(ldist * (latten.w-lpoint.w)));\n";
@@ -1295,7 +1309,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
           text << "\t lhalf = normalize(lvec - float3(0, 1, 0));\n";
         }
         text << "\t lspec *= lattenv;\n";
-        text << "\t lspec *= pow(saturate(dot(l_eye_normal.xyz, lhalf)), shininess);\n";
+        text << "\t lspec *= pow(saturate(dot(l_eye_normal, lhalf)), shininess);\n";
         text << "\t tot_specular += lspec;\n";
       }
     } else if (light._type.is_derived_from(Spotlight::get_class_type())) {
@@ -1316,7 +1330,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
       text << "\t lattenv = 1/(latten.x + latten.y*ldist + latten.z*ldist*ldist);\n";
       text << "\t lattenv *= pow(langle, latten.w);\n";
       text << "\t if (langle < ldir.w) lattenv = 0;\n";
-      text << "\t lcolor *= lattenv * saturate(dot(l_eye_normal.xyz, lvec));\n";
+      text << "\t lcolor *= lattenv * saturate(dot(l_eye_normal, lvec));\n";
       if (light._flags & ShaderKey::LF_has_shadows) {
         if (_use_shadow_filter) {
           text << "\t lshad = shadow2DProj(shadow_" << i << ", l_lightcoord" << i << ").r;\n";
@@ -1335,7 +1349,7 @@ synthesize_shader(const RenderState *rs, const GeomVertexAnimationSpec &anim) {
           text << "\t lhalf = normalize(lvec - float3(0,1,0));\n";
         }
         text << "\t lspec *= lattenv;\n";
-        text << "\t lspec *= pow(saturate(dot(l_eye_normal.xyz, lhalf)), shininess);\n";
+        text << "\t lspec *= pow(saturate(dot(l_eye_normal, lhalf)), shininess);\n";
         text << "\t tot_specular += lspec;\n";
       }
     }

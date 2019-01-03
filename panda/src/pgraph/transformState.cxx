@@ -96,6 +96,10 @@ TransformState::
   // true now, probably we've been double-deleted.
   nassertv(get_ref_count() == 0);
   _cache_stats.add_num_states(-1);
+
+#ifndef NDEBUG
+  _flags = F_is_invalid | F_is_destructing;
+#endif
 }
 
 /**
@@ -1216,6 +1220,9 @@ garbage_collect() {
       // still need to visit.
       --size;
       --si;
+      if (stop_at_element > 0) {
+        --stop_at_element;
+      }
     }
 
     si = (si + 1) % size;
